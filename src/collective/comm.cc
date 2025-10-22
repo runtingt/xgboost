@@ -6,11 +6,14 @@
 #include <algorithm>  // for copy
 #include <chrono>     // for seconds
 #include <cstdint>    // for int32_t
-#include <cstdlib>    // for exit
+#include <cstdlib>    // for exit and getenv
 #include <memory>     // for shared_ptr
+#include <mutex>      // for mutex and lock_guard
+#include <optional>   // for std::optional
+#include <set>        // for std::set
 #include <string>     // for string
 #include <thread>     // for thread
-#include <utility>    // for move, forward
+#include <utility>    // for move, forward, pair
 #if !defined(XGBOOST_USE_NCCL)
 #include "../common/common.h"           // for AssertNCCLSupport
 #endif                                  // !defined(XGBOOST_USE_NCCL)
@@ -76,6 +79,8 @@ Result ConnectTrackerImpl(proto::PeerInfo info, std::chrono::seconds timeout, st
     return next->NonBlocking(true);
   } << [&] {
     SockAddress addr;
+    LOG(DEBUG) << "Connected to ring neighbors: prev on port " << lport
+               << ", next at " << ninfo.host << ":" << ninfo.port;
     return listener->Accept(prev.get(), &addr);
   } << [&] {
     return prev->NonBlocking(true);
@@ -83,6 +88,7 @@ Result ConnectTrackerImpl(proto::PeerInfo info, std::chrono::seconds timeout, st
   if (!rc.OK()) {
     return rc;
   }
+
 
   // exchange host name and port
   std::vector<std::int8_t> buffer(HOST_NAME_MAX * comm.World(), 0);
@@ -123,6 +129,14 @@ Result ConnectTrackerImpl(proto::PeerInfo info, std::chrono::seconds timeout, st
   if (!rc.OK()) {
     return Fail("Failed to get the port from peers.", std::move(rc));
   }
+  LOG(DEBUG) << "Successfully gathered peer information, got peer ports: "
+             << [&] {
+                  std::string ports;
+                  for (auto p : peers_port) {
+                    ports += std::to_string(p) + " ";
+                  }
+                  return ports;
+                }();
 
   std::vector<proto::PeerInfo> peers(comm.World());
   for (auto r = 0; r < comm.World(); ++r) {
@@ -200,6 +214,103 @@ std::string InitLog(std::string task_id, std::int32_t rank) {
   }
   return "Task " + task_id + " got rank " + std::to_string(rank);
 }
+
+// Track ports that have already been bound in this process to avoid conflicts
+std::set<std::int32_t> g_bound_ports;
+std::mutex g_bound_ports_mutex;
+
+/**
+ * @brief Parse the XGBOOST_WORKER_PORT_RANGE environment variable
+ * @return Optional pair containing min and max port values, or nullopt if not set/invalid
+ */
+std::optional<std::pair<std::int32_t, std::int32_t>> ParseWorkerPortRange() {
+  const char* env_var = std::getenv("XGBOOST_WORKER_PORT_RANGE");
+  if (!env_var) {
+    LOG(DEBUG) << "XGBOOST_WORKER_PORT_RANGE not set.";
+    return std::nullopt;
+  }
+  LOG(DEBUG) << "XGBOOST_WORKER_PORT_RANGE is set to: " << env_var;
+  
+  std::string range_str(env_var);
+  auto pos = range_str.find('-');
+  if (pos == std::string::npos) {
+    LOG(WARNING) << "Invalid XGBOOST_WORKER_PORT_RANGE format. Expected 'min-max', got: " 
+                 << range_str;
+    return std::nullopt;
+  }
+  
+  try {
+    std::int32_t min_port = std::stoi(range_str.substr(0, pos));
+    std::int32_t max_port = std::stoi(range_str.substr(pos + 1));
+    
+    // Validate port range
+    if (min_port < 1024 || max_port > 65535 || min_port > max_port) {
+      LOG(WARNING) << "Invalid port range in XGBOOST_WORKER_PORT_RANGE: " 
+                   << range_str << ". Ports must be between 1024 and 65535.";
+      return std::nullopt;
+    }
+    
+    return std::make_pair(min_port, max_port);
+  } catch (...) {
+    LOG(WARNING) << "Failed to parse port numbers in XGBOOST_WORKER_PORT_RANGE: " 
+                 << range_str;
+    return std::nullopt;
+  }
+}
+
+/**
+ * @brief Try to bind a socket to a port in the configured range
+ * @param listener Socket to bind
+ * @param lport Pointer to store the bound port
+ * @return Result indicating success or failure
+ */
+[[nodiscard]] Result TryBindPortInRange(TCPSocket* listener, std::int32_t* lport) {
+  auto port_range = ParseWorkerPortRange();
+  if (!port_range) {
+    // No environment variable or invalid format, use default behavior
+    return listener->BindHost(lport);
+  }
+  
+  auto [min_port, max_port] = *port_range;
+  
+  LOG(DEBUG) << "Attempting to bind to a port in range " << min_port << "-" << max_port;
+  
+  // Try to bind to ports in the specified range
+  {
+    std::lock_guard<std::mutex> lock(g_bound_ports_mutex);
+    
+    for (std::int32_t port = min_port; port <= max_port; ++port) {
+      // Skip ports that have already been bound
+      if (g_bound_ports.find(port) != g_bound_ports.end()) continue;
+      
+      // Get the appropriate address (0.0.0.0 or ::) based on socket domain
+      std::string addr = (listener->Domain() == SockDomain::kV4) ? "0.0.0.0" : "::";
+      
+      std::int32_t temp_port = port;
+      auto result = listener->Bind(addr, &temp_port);
+      
+      if (result.OK() && temp_port == port) {
+        *lport = port;
+        g_bound_ports.insert(port);
+        LOG(DEBUG) << "Successfully bound to port " << *lport 
+                   << " from XGBOOST_WORKER_PORT_RANGE";
+        return Success();
+      }
+    }
+  }
+  
+  // If we couldn't bind to any port in the range, fall back to letting the OS choose
+  LOG(WARNING) << "Failed to bind to any port in the specified range (" 
+               << min_port << "-" << max_port 
+               << "), falling back to system-assigned port";
+  auto rc = listener->BindHost(lport);
+  if (rc.OK()) {
+    // Track the OS-assigned port as well
+    std::lock_guard<std::mutex> lock(g_bound_ports_mutex);
+    g_bound_ports.insert(*lport);
+  }
+  return rc;
+}
 }  // namespace
 
 RabitComm::RabitComm(std::string const& tracker_host, std::int32_t tracker_port,
@@ -242,23 +353,26 @@ Comm* RabitComm::MakeCUDAVar(Context const*, std::shared_ptr<Coll>) const {
   this->domain_ = tracker.Domain();
 
   // Start command
+  LOG(DEBUG) << "Starting bootstrap with tracker at " << this->TrackerInfo().host << ":"
+             << this->TrackerInfo().port;
   TCPSocket listener = TCPSocket::Create(tracker.Domain());
   std::int32_t lport{0};
   rc = std::move(rc) << [&] {
-    return listener.BindHost(&lport);
+    return TryBindPortInRange(&listener, &lport);
   } << [&] {
     return listener.Listen();
   };
   if (!rc.OK()) {
     return rc;
   }
+  LOG(DEBUG) << "Listening for peer workers at port " << lport;
 
   // create worker for listening to error notice.
   auto domain = tracker.Domain();
   std::shared_ptr<TCPSocket> error_sock{TCPSocket::CreatePtr(domain)};
   std::int32_t eport{0};
   rc = std::move(rc) << [&] {
-    return error_sock->BindHost(&eport);
+    return TryBindPortInRange(error_sock.get(), &eport);
   } << [&] {
     return error_sock->Listen();
   };
@@ -266,6 +380,7 @@ Comm* RabitComm::MakeCUDAVar(Context const*, std::shared_ptr<Coll>) const {
     return rc;
   }
   error_port_ = eport;
+  LOG(DEBUG) << "Listening for error signal at port " << eport;
 
   error_worker_ = std::thread{[error_sock = std::move(error_sock), init = InitNewThread{}] {
     init();
